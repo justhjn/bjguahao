@@ -53,7 +53,7 @@ class Config(object):
                     self.debug_level = logging.CRITICAL
 
                 logging.basicConfig(level=self.debug_level,
-                                    format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
+                                    format='%(asctime)s.%(msecs)03d %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
                                     datefmt='%a, %d %b %Y %H:%M:%S')
 
                 self.mobile_no = data["username"]
@@ -62,6 +62,11 @@ class Config(object):
                 self.hospital_id = data["hospitalId"]
                 self.department_id = data["departmentId"]
                 self.duty_code = data["dutyCode"]
+                try:
+                    self.change_duty_code = {"true": True, "false": False}[data["changeDutyCode"]]
+                except KeyError:
+                    self.change_duty_code = False
+
                 self.patient_name = data["patientName"]
                 self.hospital_card_id = data["hospitalCardId"]
                 self.medicare_card_id = data["medicareCardId"]
@@ -92,6 +97,7 @@ class Config(object):
                 logging.debug("医院id:" + str(self.hospital_id))
                 logging.debug("科室id:" + str(self.department_id))
                 logging.debug("上午/下午:" + str(self.duty_code))
+                logging.debug("change上午/下午:" + str(self.change_duty_code))
                 logging.debug("就诊人姓名:" + str(self.patient_name))
                 logging.debug("所选医生:" + str(self.doctorName))
                 logging.debug("是否挂儿童号:" + str(self.children))
@@ -118,7 +124,7 @@ class Guahao(object):
     挂号
     """
 
-    def __init__(self, config_path="config.yaml"):
+    def __init__(self, config_path="config.yaml", preflight_sms_code=None):
         self.browser = Browser()
         self.dutys = ""
         self.refresh_time = ''
@@ -126,9 +132,12 @@ class Guahao(object):
         self.login_url = "http://www.114yygh.com/quicklogin.htm"
         self.send_code_url = "http://www.114yygh.com/v/sendorder.htm"
         self.get_doctor_url = "http://www.114yygh.com/dpt/partduty.htm"
+        self.get_doctor_url_v2 = "http://www.114yygh.com/dpt/build/duty.htm"
         self.confirm_url = "http://www.114yygh.com/order/confirmV1.htm"
         self.patient_id_url = "http://www.114yygh.com/order/confirm/"
         self.department_url = "http://www.114yygh.com/dpt/appoint/"
+
+        self.cache_select_doctor_v2= {'request_time': 0.0, 'cached_response': None}
 
         self.config = Config(config_path)                       # config对象
         if self.config.useIMessage == 'true':
@@ -147,6 +156,8 @@ class Guahao(object):
                 self.qpython3 = None
         else:
             self.qpython3 = None
+
+        self.preflight_sms_code = preflight_sms_code
 
     def is_login(self):
 
@@ -238,8 +249,9 @@ class Guahao(object):
             'isAjax': True
         }
 
+        # logging.debug("select_doctor payload:" + payload)
         response = self.browser.post(self.get_doctor_url, data=payload)
-        logging.debug("response data:" + response.text)
+        logging.debug("select_doctor response data:" + response.text)
 
         try:
             data = json.loads(response.text)
@@ -274,16 +286,85 @@ class Guahao(object):
 
         return "NoDuty"
 
+    def select_doctor_v2(self, print_doctor_table=True):
+        """选择合适的大夫 V2"""
+        hospital_id = self.config.hospital_id
+        department_id = self.config.department_id
+        duty_code = self.config.duty_code
+        duty_date = self.config.date
+
+        # log current date
+        logging.debug("当前挂号日期: " + self.config.date)
+
+        payload = {
+            'hospitalId': hospital_id,
+            'departmentId': department_id,
+            # 'dutyCode': duty_code,
+            'dutyDate': duty_date,
+            'isAjax': True
+        }
+
+        logging.debug("select_doctor_v2 payload:" + json.dumps(payload))
+        time_epoch = time.time()
+        if time_epoch - self.cache_select_doctor_v2['request_time'] < 1.0:
+            logging.debug("use cached response")
+            response = self.cache_select_doctor_v2['cached_response']
+        else:
+            response = self.browser.post(self.get_doctor_url_v2, data=payload)
+            self.cache_select_doctor_v2['cached_response'] = response
+            self.cache_select_doctor_v2['request_time'] = time_epoch
+        logging.debug("select_doctor_v2 response data:" + response.text)
+
+        try:
+            data = json.loads(response.text)
+            if data["msg"] == "成功" and not data["hasError"] and data["code"] == 1:
+                self.dutys = data["data"].get(duty_code, [])
+            elif data["hasError"] and data["code"] == 4023:
+                # not released yet
+                logging.debug("Not released yet")
+                return "NotReady"
+            else:
+                return "NotReady"
+
+        except Exception as e:
+            logging.error(repr(e))
+            sys.exit()
+
+        # if len(self.dutys) == 0:
+        #     return "NoDuty"
+
+        if print_doctor_table:
+            self.print_doctor()
+
+        if self.config.chooseBest:
+            doctors = self.dutys[::-1]
+        else:
+            doctors = self.dutys
+
+        # 按照配置优先级选择医生
+        for doctor_conf in self.config.doctorName:
+            for doctor in doctors:
+                if doctor["doctorName"] == doctor_conf and doctor['remainAvailableNumber']:
+                    logging.info("选中:" + str(doctor["doctorName"]))
+                    return doctor
+
+        # 若没有合适的医生，默认返回最好的医生
+        for doctor in doctors:
+            if doctor['remainAvailableNumber']:
+                logging.info("选中:" + str(doctor["doctorName"]))
+                return doctor
+
+        return "NoDuty"
+
     def print_doctor(self):
 
         logging.info("当前号余量:")
         x = PrettyTable()
         x.border = True
-        x.field_names = ["医生姓名", "擅长", "号余量"]
+        x.field_names = ["医生姓名", "擅长", "Duty", "SourceId"," 号余量"]
         for doctor in self.dutys:
-            x.add_row([doctor["doctorName"], doctor['skill'], doctor['remainAvailableNumber']])
+            x.add_row([doctor["doctorName"], doctor['skill'], doctor['dutyCodeName'], doctor['dutySourceId'], doctor['remainAvailableNumber']])
         print(x.get_string())
-        pass
 
     def get_it(self, doctor, sms_code):
         """
@@ -335,9 +416,9 @@ class Guahao(object):
                 'childrenBirthday': "",
                 'isAjax': True
             }
+        logging.debug("confirm_url payload:" + json.dumps(payload))
         response = self.browser.post(self.confirm_url, data=payload)
-        logging.debug("payload:" + json.dumps(payload))
-        logging.debug("response data:" + response.text)
+        logging.debug("confirm_url response data:" + response.text)
 
         try:
             data = json.loads(response.text)
@@ -417,19 +498,28 @@ class Guahao(object):
         self.start_time = datetime.datetime.strptime(con_data_str, '%Y-%m-%d %H:%M:%S') + datetime.timedelta(days= - int(appoint_day))
         logging.info("放号时间: " + self.start_time.strftime("%Y-%m-%d %H:%M"))
 
-    def get_sms_verify_code(self):
-        """获取短信验证码"""
+    def request_sms_verify_code(self):
         response = self.browser.post(self.send_code_url, "")
         data = json.loads(response.text)
         logging.debug(response.text)
+        return data
+
+    def get_sms_verify_code(self):
+        """获取短信验证码"""
+        data = self.request_sms_verify_code()
         if data["msg"] == "OK." and data["code"] == 200:
-            logging.info("获取验证码成功")
+            logging.info("Request 验证码成功")
             if self.imessage is not None: # 如果使用 iMessage
+                logging.debug("Wait for iMessage")
                 code = self.imessage.get_verify_code()
             elif self.qpython3 is not None: # 如果使用 QPython3
+                logging.debug("Wait for Android SMS")
                 code = self.qpython3.get_verify_code()
             else:
-                code = input("输入短信验证码: ")
+                while True:
+                    code = input("输入短信验证码: ")
+                    if len(code) == 6:
+                        break
             return code
         elif data["msg"] == "短信发送太频繁" and data["code"] == 812:
             logging.error(data["msg"])
@@ -452,7 +542,6 @@ class Guahao(object):
                 time.sleep(sleep_time)
                 # 自动重新登录
                 self.auth_login()
-        pass
 
     def run(self):
         """主逻辑"""
@@ -461,7 +550,18 @@ class Guahao(object):
         self.lazy()
         doctor = ""
         while True:
-            doctor = self.select_doctor()       # 2. 选择医生
+            prv_duty_code = self.config.duty_code
+            doctor = self.select_doctor_v2()       # 2. 选择医生
+
+            if self.config.change_duty_code:
+                if doctor == "NoDuty" or doctor == "NotReady":
+                    logging.info("change duty code and try again")
+                    if self.config.duty_code == "1":
+                        self.config.duty_code = "2"
+                    else:
+                        self.config.duty_code = "1"
+                    doctor = self.select_doctor_v2(print_doctor_table=True)
+            
             self.get_patient_id(doctor)         # 3. 获取病人id
             if doctor == "NoDuty":
                 # 如果当前时间 > 放号时间 + 30s
@@ -479,13 +579,19 @@ class Guahao(object):
                 logging.info("好像还没放号？重试中")
                 time.sleep(1)
             else:
-                sms_code = self.get_sms_verify_code()               # 获取验证码
-                if sms_code is None:
-                    time.sleep(1)
+                # print("Good")
+                # sys.exit(0)
+                if self.preflight_sms_code:
+                    sms_code = self.preflight_sms_code
+                else:
+                    sms_code = self.get_sms_verify_code()               # 获取验证码
+                    if sms_code is None:
+                        time.sleep(1)
 
                 result = self.get_it(doctor, sms_code)              # 4.挂号
                 if result:
                     break                                           # 挂号成功
+            self.config.duty_code = prv_duty_code
 
 
 if __name__ == "__main__":
@@ -493,6 +599,15 @@ if __name__ == "__main__":
     if (len(sys.argv) == 3) and (sys.argv[1] == '-c') and (isinstance(sys.argv[2], str)):
         config_path = sys.argv[2]
         guahao = Guahao(config_path)
+    elif (len(sys.argv) == 2) and (sys.argv[1] == '-getsmscode'):
+        guahao = Guahao()
+        # guahao.get_duty_time()
+        guahao.auth_login()
+        guahao.request_sms_verify_code()
+        sys.exit()
+    elif (len(sys.argv) == 3) and (sys.argv[1] == '-setsmscode') and (isinstance(sys.argv[2], str)):
+        sms_code = sys.argv[2]
+        guahao = Guahao(preflight_sms_code=sms_code)
     else:
         guahao = Guahao()
     guahao.run()
